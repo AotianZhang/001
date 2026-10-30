@@ -1,0 +1,10 @@
+{
+  "name": "svg-editor-cli",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "cli": "node --experimental-transform-types src/cli.ts",
+    "test": "node --experimental-transform-types tests/smoke.test.ts"
+  }
+}
