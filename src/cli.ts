@@ -1,0 +1,44 @@
+import {createInterface} from 'node:readline';
+import {readFileSync,writeFileSync} from 'node:fs';
+import {DocumentModel} from './domain/Document.ts';
+import {ShapeFactory} from './domain/ShapeFactory.ts';
+import {GroupShape} from './domain/GroupShape.ts';
+import {SvgCodec} from './io/SvgCodec.ts';
+import {History,MutationCommand} from './commands/Command.ts';
+import type {Shape} from './domain/Shape.ts';
+
+let doc:DocumentModel|undefined;
+const history=new History(); const factory=new ShapeFactory(); const codec=new SvgCodec(); let ioBlocked=false;
+const HELP=`init [w] [h]\nread <file.svg>\nsave [file.svg]\ncanvas [w] [h]\ncreate <type> <id> [params...] [in <containerId>]\ndelete <id>\nmove <id> <dx> <dy>\nscale <id> <factor>\nset <id> <attr> <value>\ngroup <newGid> <id1> <id2>...\nungroup <gid>\naddto <gid> <id>\nfront <id>\nback <id>\ntree [id]\nshow <id>\nundo\nredo\nhelp`;
+
+function tokenize(line:string):string[]{const out:string[]=[];const re=/"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|(\S+)/g;let m:RegExpExecArray|null;while(m=re.exec(line))out.push(m[1]??m[2]??m[3]);return out.map(s=>s.replace(/\\(["'\\])/g,'$1'));}
+function need():DocumentModel{if(!doc)throw new Error("no document. use 'init' or 'read' first");return doc;}
+function num(s:string|undefined,name:string):number{const n=Number(s);if(!Number.isFinite(n))throw new Error(`${name} must be a finite number`);return n;}
+function edit<T>(operation:(d:DocumentModel)=>string):string{const d=need();const result=history.execute(new MutationCommand(operation),d);ioBlocked=false;return result;}
+function shape(d:DocumentModel,id:string):Shape{const s=d.find(id);if(!s||id==='__root')throw new Error(`no such shape: ${id}`);return s;}
+
+export function execute(line:string):string|undefined{
+  const a=tokenize(line);if(!a.length)return;const cmd=a[0].toLowerCase();
+  if(cmd==='help')return HELP;
+  if(cmd==='init'){const w=a[1]?num(a[1],'width'):800,h=a[2]?num(a[2],'height'):600;if(w<=0||h<=0)throw new Error('canvas dimensions must be positive');doc=new DocumentModel(w,h);ioBlocked=true;history.block();return `canvas ${w}x${h} created`;}
+  if(cmd==='read'){const file=a[1];if(!file)throw new Error('read requires a file');try{const parsed=codec.parse(readFileSync(file,'utf8'),file);doc=parsed.document;ioBlocked=true;history.block();return [...parsed.warnings,`read ${file} (${doc.count()} elements)`].join('\n');}catch(e){if((e as Error).message.startsWith('cannot read'))throw e;throw new Error(`cannot read file: ${file}`);}}
+  if(cmd==='save'){const d=need(),file=a[1]??d.path;if(!file)throw new Error('save requires a file');try{writeFileSync(file,codec.serialize(d),'utf8');d.path=file;ioBlocked=true;history.block();return `saved to ${file} (${d.count()} elements)`;}catch{throw new Error(`cannot write file: ${file}`);}}
+  if(cmd==='canvas'){const d=need();if(!a[1])return `canvas ${d.width}x${d.height}`;const w=num(a[1],'width'),h=num(a[2],'height');if(w<=0||h<=0)throw new Error('canvas dimensions must be positive');d.width=w;d.height=h;ioBlocked=true;history.block();return `canvas ${w}x${h}`;}
+  const d=need();
+  if(cmd==='create'){const type=a[1],id=a[2];if(!type||!id)throw new Error('create requires type and id');const at=a.indexOf('in');const params=a.slice(3,at<0?undefined:at);const parentId=at<0?undefined:a[at+1];const parent=parentId?shape(d,parentId):d.root;if(!parent.isContainer())throw new Error(`not a container: ${parentId}`);const required=type==='rect'?4:type==='circle'?3:type==='ellipse'?4:type==='line'?4:type==='text'?2:0;if(params.length<required)throw new Error(`invalid parameters for ${type}`);const style:Record<string,string>={};if(['rect','circle','ellipse'].includes(type)&&params[required])style.fill=params[required];if(type==='line'&&params[required])style.stroke=params[required];const created=factory.create(type,id,params,style);return edit(doc=>{doc.add(created,parent as GroupShape);return parentId?`${created.type}#${created.id} created in g#${parentId}`:`${created.type}#${created.id} created`;});}
+  if(cmd==='delete'){const id=a[1];return edit(d=>{const s=shape(d,id),p=s.parent as GroupShape;p.removeChild(s);d.unregister(s);return `${s.type}#${id} deleted`;});}
+  if(cmd==='move'){const id=a[1],dx=num(a[2],'dx'),dy=num(a[3],'dy');return edit(d=>{const s=shape(d,id);s.move(dx,dy);return `${s.type}#${id} moved by (${dx},${dy})`;});}
+  if(cmd==='scale'){const id=a[1],factor=num(a[2],'factor');if(factor<=0)throw new Error('scale factor must be positive');return edit(d=>{const s=shape(d,id);s.scale(factor);return `${s.type}#${id} scaled by ${factor}`;});}
+  if(cmd==='set'){const id=a[1],attr=a[2],value=a.slice(3).join(' ');if(!attr||value===undefined)throw new Error('set requires id, attribute and value');return edit(d=>{const s=shape(d,id);s.setAttribute(attr,value);return `${s.type}#${id} updated: ${attr}="${value}"`;});}
+  if(cmd==='addto'){const gid=a[1],id=a[2];return edit(d=>{const target=shape(d,gid),s=shape(d,id);if(!target.isContainer())throw new Error(`not a container: ${gid}`);if(target===s||s.contains(target))throw new Error(`cannot add container into its own descendant: ${gid}`);(s.parent as GroupShape).removeChild(s);(target as GroupShape).addChild(s);return `${s.type}#${id} moved to g#${gid}`;});}
+  if(cmd==='group'){const gid=a[1],ids=a.slice(2);if(!gid||!ids.length)throw new Error('group requires id and at least one shape');return edit(d=>{const ss=ids.map(id=>shape(d,id));for(const s of ss)for(const t of ss)if(s!==t&&(s===t.parent||s.contains(t)))throw new Error(`cannot group a container into its own descendant: ${s.id}`);const originalParents=ss.map(s=>s.parent as GroupShape);const sameParent=originalParents.every(p=>p===originalParents[0]);const parent=sameParent?originalParents[0]:d.root;const indexes=ss.map(s=>originalParents[ss.indexOf(s)].children().indexOf(s));const insertion=Math.min(...indexes.filter(i=>i>=0));const g=new GroupShape(gid);d.add(g,parent);parent.removeChild(g);parent.addChild(g,Number.isFinite(insertion)?insertion:parent.children().length);for(const s of ss){(s.parent as GroupShape).removeChild(s);g.addChild(s);}return `g#${gid} created with ${ss.length} children`;});}
+  if(cmd==='ungroup'){const id=a[1];return edit(d=>{const g=shape(d,id);if(!g.isContainer())throw new Error(`not a container: ${id}`);if((g as GroupShape).kind!=='g')throw new Error(`cannot ungroup composite shape: ${id}`);const p=g.parent as GroupShape;if(!p||p===d.root)throw new Error(`cannot ungroup top-level container: ${id}`);const i=p.removeChild(g);const cs=g.children();cs.forEach((c,n)=>p.addChild(c,i+n));d.unregister(g);return `g#${id} ungrouped`;});}
+  if(cmd==='front'||cmd==='back'){const id=a[1];return edit(d=>{const s=shape(d,id),p=s.parent as GroupShape;if(!p)throw new Error(`no such shape: ${id}`);p.removeChild(s);p.addChild(s,cmd==='front'?p.children().length:0);return `${s.type}#${id} moved to ${cmd}`;});}
+  if(cmd==='tree'){const s=a[1]?shape(d,a[1]):d.root;return renderTree(s,d,'');}
+  if(cmd==='show'){const s=shape(d,a[1]);const attrs=Object.entries(s.getAttributes()).filter(([k])=>k!=='text').map(([k,v])=>`  ${k}=${v}`).join('\n');return `${s.summary()} parent=${s.parent?s.parent.type+'#'+s.parent.id:'svg'}${attrs?'\n'+attrs:''}`;}
+  if(cmd==='undo'){if(ioBlocked)throw new Error('undo not allowed after io command');history.undo(d);return 'undone';}
+  if(cmd==='redo'){if(ioBlocked)throw new Error('redo not allowed after io command');history.redo(d);return 'redone';}
+  throw new Error(`unknown command: ${cmd}`);
+}
+function renderTree(s:Shape,d:DocumentModel,prefix='',last=true):string{const root=s===d.root;const lines=[root?`svg (${d.width}x${d.height})`:prefix+(last?'└── ':'├── ')+s.summary()];const childPrefix=root?'':prefix+(last?'    ':'│   ');const cs=s.children();cs.forEach((c,i)=>lines.push(renderTree(c,d,childPrefix,i===cs.length-1)));return lines.join('\n');}
+const rl=createInterface({input:process.stdin,output:process.stdout,terminal:true});if(process.stdin.isTTY)console.log("svg-editor 0.1 — type 'help' for commands");rl.setPrompt('svg> ');if(process.stdin.isTTY)rl.prompt();rl.on('line',line=>{if(line.trim().startsWith('#')){if(process.stdin.isTTY)rl.prompt();return;}try{const out=execute(line.trim());if(out!==undefined)console.log(out);}catch(e){console.log(`error: ${(e as Error).message}`);}if(process.stdin.isTTY)rl.prompt();});
